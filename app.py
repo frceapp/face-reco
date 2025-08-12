@@ -1,6 +1,6 @@
 # app.py
-# Dependencies: pip install flask opencv-python numpy
-# Run: python app.py  → http://localhost:5000
+# Dependencies: pip install -r requirements.txt
+# Run: uvicorn app:app --host 0.0.0.0 --port 8000
 
 import os
 import time
@@ -8,9 +8,15 @@ import base64
 import hashlib
 import numpy as np
 import cv2
-from flask import Flask, jsonify, request, render_template, send_from_directory, Response
+import face_recognition
+from fastapi import FastAPI, Request
+from fastapi.responses import Response, FileResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 MASTER_CODE = "MASTER-REGISTER"
 SAVE_DIR = os.path.join(os.path.dirname(__file__), "saved")
@@ -174,20 +180,19 @@ def _push_extra(score: float, jpg: bytes, exclude_hashes: set):
         state["extras"] = state["extras"][:2]
 
 # -------------------------- Routes --------------------------
-@app.route("/")
-def index():
-    return render_template("index.html", master=MASTER_CODE)
+@app.get("/")
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "master": MASTER_CODE})
 
-@app.route("/ui_state")
-def ui_state():
-    return jsonify(_build_ui(""))
+@app.get("/ui_state")
+async def ui_state():
+    return _build_ui("")
 
-@app.route("/scan", methods=["POST"])
-def scan_route():
-    data = request.get_json(silent=True) or {}
+@app.post("/scan")
+async def scan_route(data: dict):
     code = (data.get("code") or "").strip()
     if not code:
-        return jsonify(_build_ui("Kode kosong."))
+        return _build_ui("Kode kosong.")
 
     now = time.time()
 
@@ -195,14 +200,14 @@ def scan_route():
     if code == MASTER_CODE:
         if state["mode"] == "IDLE":
             _enter_register()
-            return jsonify(_build_ui("REGISTER aktif. Scan user."))
+            return _build_ui("REGISTER aktif. Scan user.")
         else:
             _enter_idle()
-            return jsonify(_build_ui("Kembali ke IDLE."))
+            return _build_ui("Kembali ke IDLE.")
     
     # Harus di REGISTER untuk menerima user
     if state["mode"] != "REGISTER":
-        return jsonify(_build_ui("Bukan REGISTER. Scan MASTER untuk masuk."))
+        return _build_ui("Bukan REGISTER. Scan MASTER untuk masuk.")
 
     scanned_user = code
 
@@ -210,7 +215,7 @@ def scan_route():
     if state["pending_preview"] and state["current_user"] == scanned_user and now < state["preview_expires_at"]:
         _new_session()
         state["current_user"] = scanned_user
-        return jsonify(_build_ui(f"Ulang capture untuk {scanned_user}. Ikuti panduan."))
+        return _build_ui(f"Ulang capture untuk {scanned_user}. Ikuti panduan.")
 
     # Beralih ke user baru: mulai sesi baru (data user sebelumnya sudah otomatis tersimpan saat step=3)
     state["current_user"] = scanned_user
@@ -223,30 +228,29 @@ def scan_route():
         ui["reask_text"] = "Scan lagi (≤10s) untuk mulai ulang."
         state["pending_preview"] = True
         state["preview_expires_at"] = now + 10
-        return jsonify(ui)
+        return ui
 
-    return jsonify(_build_ui(f"Mulai capture untuk {scanned_user}. Ikuti panduan tiap langkah."))
+    return _build_ui(f"Mulai capture untuk {scanned_user}. Ikuti panduan tiap langkah.")
 
-@app.route("/capture_auto", methods=["POST"])
-def capture_auto():
+@app.post("/capture_auto")
+async def capture_auto(data: dict):
     """
     Body: { session_id: <int>, images: [ {image: <dataURL>, yaw: <float>} , ... ] }
     Memilih satu terbaik per langkah; menyimpan dua ekstra terbaik global (non-duplicated).
     Setelah langkah ke-3 selesai → SIMPAN OTOMATIS ke /saved/<uid>/.
     """
     if state["mode"] != "REGISTER" or not state["current_user"]:
-        return jsonify(_build_ui("Tidak dapat capture: bukan REGISTER atau belum ada user."))
+        return _build_ui("Tidak dapat capture: bukan REGISTER atau belum ada user.")
     if state["capture_step"] >= 3:
-        return jsonify(_build_ui("Capture lengkap."))
+        return _build_ui("Capture lengkap.")
 
-    data = request.get_json(silent=True) or {}
     client_sid = data.get("session_id", None)
     if client_sid is None or int(client_sid) != int(state["session_id"]):
-        return jsonify(_build_ui("Batch diabaikan (sesi berubah)."))
+        return _build_ui("Batch diabaikan (sesi berubah).")
 
     items = data.get("images", [])
     if not isinstance(items, list) or len(items) == 0:
-        return jsonify(_build_ui("Batch kosong."))
+        return _build_ui("Batch kosong.")
 
     step = state["capture_step"]
 
@@ -266,7 +270,7 @@ def capture_auto():
         candidates.append((score, sharp, raw))
 
     if not candidates:
-        return jsonify(_build_ui("Orientasi/ketajaman belum sesuai. Ulangi posisi sesuai panduan."))
+        return _build_ui("Orientasi/ketajaman belum sesuai. Ulangi posisi sesuai panduan.")
 
     # pemenang langkah
     candidates.sort(key=lambda x: x[0], reverse=True)
@@ -287,25 +291,55 @@ def capture_auto():
         _save_now(uid)
         state["pending_preview"] = True
         state["preview_expires_at"] = time.time() + 10
-        return jsonify(_build_ui("Tiga sudut lengkap. Data tersimpan. Pratinjau tampil 10 detik."))
+        return _build_ui("Tiga sudut lengkap. Data tersimpan. Pratinjau tampil 10 detik.")
 
-    return jsonify(_build_ui("Langkah tersimpan. Lanjut ke panduan berikutnya."))
+    return _build_ui("Langkah tersimpan. Lanjut ke panduan berikutnya.")
 
-@app.route("/buffer/<int:index>.jpg")
-def buffer_image(index: int):
+@app.get("/buffer/{index}.jpg")
+async def buffer_image(index: int):
     if 0 <= index < len(state["captured_jpegs"]):
-        return Response(state["captured_jpegs"][index], mimetype="image/jpeg")
-    return Response(status=404)
+        return Response(content=state["captured_jpegs"][index], media_type="image/jpeg")
+    return Response(status_code=404)
 
-@app.route("/saved/<uid>/<int:index>.jpg")
-def get_saved(uid, index):
+@app.get("/saved/{uid}/{index}.jpg")
+async def get_saved(uid: str, index: int):
     mapping = LABELS  # 0→front_1.jpg, 1→left_1.jpg, 2→right_1.jpg
     if not (0 <= index < 3):
-        return Response(status=404)
+        return Response(status_code=404)
     path = os.path.join(SAVE_DIR, uid, mapping[index])
     if os.path.exists(path):
-        return send_from_directory(os.path.dirname(path), os.path.basename(path))
-    return Response(status=404)
+        return FileResponse(path)
+    return Response(status_code=404)
+
+@app.post("/recognize")
+async def recognize(data: dict):
+    image_b64 = data.get("image", "")
+    bgr, _ = _decode_b64_to_bgr(image_b64)
+    if bgr is None:
+        return {"result": "invalid"}
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    encs = face_recognition.face_encodings(rgb)
+    if not encs:
+        return {"result": "no_face"}
+    query = encs[0]
+    best_user = None
+    best_dist = 0.6
+    for uid in os.listdir(SAVE_DIR):
+        ref_path = os.path.join(SAVE_DIR, uid, LABELS[0])
+        if not os.path.exists(ref_path):
+            continue
+        img = face_recognition.load_image_file(ref_path)
+        ref_enc = face_recognition.face_encodings(img)
+        if not ref_enc:
+            continue
+        dist = face_recognition.face_distance(ref_enc, query)[0]
+        if dist < best_dist:
+            best_dist = dist
+            best_user = uid
+    if best_user:
+        return {"result": "match", "user": best_user, "distance": float(best_dist)}
+    return {"result": "unknown"}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True, debug=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
