@@ -1,7 +1,3 @@
-# app.py
-# Dependencies: pip install -r requirements.txt
-# Run: uvicorn app:app --host 0.0.0.0 --port 8000
-
 import os
 import time
 import base64
